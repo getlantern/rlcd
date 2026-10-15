@@ -39,6 +39,11 @@ func Parse(raw []byte) (*File, error) {
 		if err := dec.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("parsing JSON: %w", err)
 		}
+		// Concatenated documents, such as --lines output, are one file
+		// per request; silently using only the first would drop the rest.
+		if dec.More() {
+			return nil, errors.New("parsing JSON: trailing data after the first document")
+		}
 	} else if err := toml.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("parsing TOML: %w", err)
 	}

@@ -38,34 +38,30 @@ func (cli) Version() string { return "rlcd " + version }
 type exampleCmd struct{}
 
 // usageError reports bad flags or an invalid questions file; exit code 2.
-type usageError struct{ msg string }
+type usageError struct{ err error }
 
-func (e *usageError) Error() string { return e.msg }
+func (e *usageError) Error() string { return e.err.Error() }
+func (e *usageError) Unwrap() error { return e.err }
 
+// usagef formats like fmt.Errorf, including %w, as a usageError.
 func usagef(format string, args ...any) error {
-	return &usageError{msg: fmt.Sprintf(format, args...)}
+	return &usageError{err: fmt.Errorf(format, args...)}
 }
 
 func main() {
 	var args cli
 	p := arg.MustParse(&args)
 
-	level := pterm.LogLevelInfo
-	if args.Verbose {
-		level = pterm.LogLevelDebug
-	}
 	if !isTerminal(os.Stderr) {
 		pterm.DisableColor()
 	}
-	// pterm logs to stdout by default, which would corrupt piped output.
-	logger := pterm.DefaultLogger.WithWriter(os.Stderr).WithLevel(level)
-	slog.SetDefault(slog.New(pterm.NewSlogHandler(logger)))
+	slog.SetDefault(newLogger(os.Stderr, args.Verbose))
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelOnInterrupt(ctx, cancel)
 
 	err := run(ctx, &args, os.Stdin, os.Stdout)
-	stop()
 	var usage *usageError
 	switch {
 	case err == nil:
@@ -75,10 +71,42 @@ func main() {
 	case errors.As(err, &usage):
 		slog.ErrorContext(ctx, "invalid usage", "error", err)
 		os.Exit(2)
+	case errors.Is(err, context.Canceled):
+		slog.ErrorContext(ctx, "interrupted", "error", err)
+		os.Exit(130)
 	default:
 		slog.ErrorContext(ctx, "run failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// newLogger logs through pterm to w. pterm writes to stdout by default,
+// which would corrupt piped output, so the writer is always explicit.
+func newLogger(w io.Writer, verbose bool) *slog.Logger {
+	level := pterm.LogLevelInfo
+	if verbose {
+		level = pterm.LogLevelDebug
+	}
+	logger := pterm.DefaultLogger.WithWriter(w).WithLevel(level)
+	return slog.New(pterm.NewSlogHandler(logger))
+}
+
+// cancelOnInterrupt cancels ctx on the first Ctrl-C so in-flight work
+// stops cleanly, then restores the default handler. Reading stdin does
+// not watch ctx, so a second Ctrl-C must still be able to exit.
+func cancelOnInterrupt(ctx context.Context, cancel context.CancelFunc) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		// Reset restores the default handler: a second Ctrl-C exits.
+		defer signal.Reset(os.Interrupt)
+		select {
+		case <-sig:
+			slog.WarnContext(ctx, "interrupted; press Ctrl-C again to exit now")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 }
 
 func run(ctx context.Context, args *cli, stdin io.Reader, stdout io.Writer) error {
@@ -114,6 +142,9 @@ func newClient() (*typesafe.Client, error) {
 		return nil, usagef("set TYPESAFE_API_KEY")
 	}
 	c := typesafe.NewClient(key)
+	// ask bounds each state with --timeout. A fixed per-attempt timeout
+	// would cut off long-context requests and retry them pointlessly.
+	c.HTTP.Timeout = 0
 	if raw := strings.TrimSpace(os.Getenv("TYPESAFE_BASE_URL")); raw != "" {
 		u, err := url.Parse(raw)
 		if err != nil || u.Scheme != "https" || u.Host == "" {

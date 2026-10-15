@@ -7,9 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Example response from https://docs.typesafe.ai/api, all three types.
@@ -249,5 +251,107 @@ func TestAskLongContextHeader(t *testing.T) {
 		if got != want {
 			t.Errorf("LongContext=%v: header = %q, want %q", on, got, want)
 		}
+	}
+}
+
+// Failures that a retry cannot fix must return after one request.
+func TestAskDoesNotRetry(t *testing.T) {
+	for name, tc := range map[string]struct {
+		handler func(w http.ResponseWriter, cancel context.CancelFunc)
+		want    string
+	}{
+		"cancelled context": {
+			handler: func(w http.ResponseWriter, cancel context.CancelFunc) {
+				cancel()
+				w.WriteHeader(http.StatusServiceUnavailable)
+			},
+			want: "context canceled",
+		},
+		"undecodable body": {
+			handler: func(w http.ResponseWriter, _ context.CancelFunc) {
+				write(t, w, "not json")
+			},
+			want: "decoding response",
+		},
+		"oversized body": {
+			handler: func(w http.ResponseWriter, _ context.CancelFunc) {
+				write(t, w, strings.Repeat("x", maxResponse+1))
+			},
+			want: "exceeds",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var calls atomic.Int32
+			c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				tc.handler(w, cancel)
+			})
+			_, err := c.Ask(ctx, Request{
+				State:     "x",
+				Questions: map[string]Question{"q": Noul("?")},
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to contain %q", err, tc.want)
+			}
+			if n := calls.Load(); n != 1 {
+				t.Errorf("calls = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestTruncateKeepsUTF8(t *testing.T) {
+	// "é" is two bytes; cutting at 2 would split the second one.
+	got := truncate("aéé", 2)
+	if !utf8.ValidString(got) || got != "a…" {
+		t.Errorf("truncate = %q", got)
+	}
+}
+
+// A deadline that ends a retry wait must not hide the API error.
+func TestAskKeepsAPIErrorAtDeadline(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "20")
+		w.Header().Set("x-typesafe-request-id", "req_1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Ask(ctx, Request{
+		State:     "x",
+		Questions: map[string]Question{"q": Noul("?")},
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.RequestID != "req_1" {
+		t.Errorf("err = %v, want the 429 APIError", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Error("waited for a retry that could not finish before the deadline")
+	}
+}
+
+func TestZeroClientUsesDefaults(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Error(err)
+		}
+		write(t, w, docsResponse)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Only URL is set, to reach the test server; Model and HTTP are zero.
+	c := &Client{Key: "k", URL: srv.URL}
+	if _, err := c.Ask(context.Background(), Request{
+		State:     "x",
+		Questions: map[string]Question{"q": Noul("?")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got["model"] != DefaultModel {
+		t.Errorf("model = %v, want %s", got["model"], DefaultModel)
 	}
 }

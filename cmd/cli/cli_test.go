@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -22,17 +26,17 @@ var exampleIDs = []string{
 }
 
 func TestExampleIsValid(t *testing.T) {
-	rf, err := loadRequest("example.toml", nil)
+	qf, err := loadQuestions("example.toml", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := rf.Problems(); len(p) > 0 {
+	if p := qf.Problems(); len(p) > 0 {
 		t.Fatalf("example.toml invalid: %v", p)
 	}
-	if !slices.Equal(rf.Order, exampleIDs) {
-		t.Errorf("order = %v, want file order %v", rf.Order, exampleIDs)
+	if !slices.Equal(qf.Order, exampleIDs) {
+		t.Errorf("order = %v, want file order %v", qf.Order, exampleIDs)
 	}
-	crit := rf.Questions["department"].Criteria.(map[string]any)
+	crit := qf.Questions["department"].Criteria.(map[string]any)
 	if v, ok := crit["other"]; !ok || v != nil {
 		t.Errorf(`"" should become null, got %#v`, v)
 	}
@@ -43,19 +47,19 @@ func TestExampleIsValid(t *testing.T) {
 func TestDryRunRoundTrips(t *testing.T) {
 	var out bytes.Buffer
 	a := askCmd{Questions: "example.toml", Text: "hi", StateFormat: "auto",
-		Out: "-", Format: "json", DryRun: true}
+		Out: "-", Format: "json", DryRun: true, Timeout: time.Second}
 	if err := a.run(context.Background(), nil, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	rf, err := loadRequest("-", &out)
+	qf, err := loadQuestions("-", &out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := rf.Problems(); len(p) > 0 {
+	if p := qf.Problems(); len(p) > 0 {
 		t.Fatal(p)
 	}
-	if rf.State != "hi" || len(rf.Questions) != len(exampleIDs) {
-		t.Errorf("round trip = state %v, %d questions", rf.State, len(rf.Questions))
+	if qf.State != "hi" || len(qf.Questions) != len(exampleIDs) {
+		t.Errorf("round trip = state %v, %d questions", qf.State, len(qf.Questions))
 	}
 }
 
@@ -185,9 +189,12 @@ func TestAskTable(t *testing.T) {
 
 func TestAskUsageErrors(t *testing.T) {
 	for name, a := range map[string]askCmd{
-		"both stdin": {Questions: "-", State: "-", StateFormat: "auto", Format: "json"},
-		"bad format": {Questions: "example.toml", StateFormat: "auto", Format: "yaml"},
-		"text+state": {Questions: "example.toml", Text: "x", State: "f", StateFormat: "auto", Format: "json"},
+		"both stdin":        {Questions: "-", State: "-", StateFormat: "auto", Format: "json"},
+		"bad format":        {Questions: "example.toml", StateFormat: "auto", Format: "yaml"},
+		"text+state":        {Questions: "example.toml", Text: "x", State: "f", StateFormat: "auto", Format: "json"},
+		"zero timeout":      {Questions: "example.toml", Text: "x", StateFormat: "auto", Format: "json"},
+		"no questions file": {Questions: "missing.toml", Text: "x", StateFormat: "auto", Format: "json", Timeout: time.Second},
+		"no state file":     {Questions: "example.toml", State: "missing.txt", StateFormat: "auto", Format: "json", Timeout: time.Second, DryRun: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := a.run(context.Background(), nil, strings.NewReader(""), io.Discard)
@@ -245,5 +252,144 @@ func TestAskLongContextFlag(t *testing.T) {
 	}
 	if got != "true" {
 		t.Errorf("long-context header = %q, want true", got)
+	}
+}
+
+// testdata/docs holds the request bodies published at docs.typesafe.ai.
+// Each must load as a questions file and come back from --dry-run
+// unchanged, so examples from the docs work as-is.
+func TestDocsRequestsRoundTrip(t *testing.T) {
+	paths, err := filepath.Glob("testdata/docs/*.json")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no testdata: %v", err)
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			var out bytes.Buffer
+			a := askCmd{Questions: path, StateFormat: "auto", Out: "-",
+				Format: "json", DryRun: true, Timeout: time.Second}
+			if err := a.run(context.Background(), nil, nil, &out); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want, got any
+			if err := json.Unmarshal(raw, &want); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			// Some doc snippets omit the required model; ask fills in
+			// the default, and nothing else may change.
+			if w := want.(map[string]any); w["model"] == nil {
+				w["model"] = typesafe.DefaultModel
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("round trip changed the request\n got: %s\nwant: %s",
+					out.Bytes(), raw)
+			}
+		})
+	}
+}
+
+func TestCreateOutputIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.jsonl")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A failed run leaves the previous file and no temp files.
+	w, commit, err := createOutput(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, w, "partial\n")
+	if err := commit(false); err != nil {
+		t.Fatal(err)
+	}
+	assertDir(t, dir, path, "old\n")
+
+	// A successful run replaces it whole.
+	w, commit, err = createOutput(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, w, "new\n")
+	if err := commit(true); err != nil {
+		t.Fatal(err)
+	}
+	assertDir(t, dir, path, "new\n")
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Errorf("mode = %v, want 0644 (err %v)", fi.Mode().Perm(), err)
+	}
+}
+
+// assertDir checks path holds want and is the only file in dir.
+func assertDir(t *testing.T, dir, path, want string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("dir has %d entries, want 1 (temp file left behind?)", len(entries))
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("%s = %q, want %q", path, got, want)
+	}
+}
+
+func TestCheck(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "bad.toml")
+	err := os.WriteFile(bad, []byte("[[questions]]\nid='q'\ntype='score'\ninstructions='x'\ncriteria=['a']\n"), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&checkCmd{Files: []string{"example.toml"}}).run(context.Background(), nil); err != nil {
+		t.Errorf("valid file: %v", err)
+	}
+	err = (&checkCmd{Files: []string{"example.toml", bad}}).run(context.Background(), nil)
+	var usage *usageError
+	if !errors.As(err, &usage) || !strings.Contains(err.Error(), "1 of 2") {
+		t.Errorf("invalid file: err = %v, want usageError for 1 of 2", err)
+	}
+}
+
+// stdout carries only results; every log line, including per-state
+// failures, must go to the logger's writer.
+func TestLogsStayOffStdout(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(newLogger(&logs, true))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	c, _ := fakeAPI(t)
+	var out bytes.Buffer
+	a := askCmd{Questions: "example.toml", StateFormat: "text", Lines: true,
+		Out: "-", Format: "json", Timeout: 5 * time.Second}
+	_ = a.run(context.Background(), c, strings.NewReader("ok\nreject\n"), &out)
+
+	for i, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Errorf("stdout line %d is not JSON: %q", i+1, line)
+		}
+	}
+	if !strings.Contains(logs.String(), "state failed") {
+		t.Errorf("failure was not logged to the logger's writer:\n%s", logs.String())
+	}
+}
+
+func write(t *testing.T, w io.Writer, s string) {
+	t.Helper()
+	if _, err := io.WriteString(w, s); err != nil {
+		t.Errorf("writing: %v", err)
 	}
 }

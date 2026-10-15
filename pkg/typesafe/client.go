@@ -2,6 +2,7 @@ package typesafe
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,7 +28,8 @@ const (
 	maxRetryAfter = 30 * time.Second
 )
 
-// Client calls the System One API.
+// Client calls the System One API. Empty URL and Model fall back to
+// DefaultURL and DefaultModel, and a nil HTTP to http.DefaultClient.
 type Client struct {
 	Key   string
 	URL   string
@@ -34,6 +37,8 @@ type Client struct {
 	HTTP  *http.Client
 	// LongContext raises the context limits to 262k tokens per request.
 	// It is slower and less accurate, so enable it only when needed.
+	// Long requests can outlast NewClient's 30s HTTP timeout; raise or
+	// clear HTTP.Timeout and bound the call with ctx instead.
 	LongContext bool
 }
 
@@ -62,6 +67,8 @@ func (e *APIError) Error() string {
 }
 
 // Ask evaluates req. An empty req.Model uses the client's model.
+// After retries, an API failure is returned as *APIError, even when the
+// context ends while waiting to retry.
 func (c *Client) Ask(ctx context.Context, req Request) (*Response, error) {
 	if c.Key == "" {
 		return nil, errors.New("typesafe: missing API key")
@@ -69,9 +76,7 @@ func (c *Client) Ask(ctx context.Context, req Request) (*Response, error) {
 	if len(req.Questions) == 0 {
 		return nil, errors.New("typesafe: at least one question is required")
 	}
-	if req.Model == "" {
-		req.Model = c.Model
-	}
+	req.Model = cmp.Or(req.Model, c.Model, DefaultModel)
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("typesafe: encoding request: %w", err)
@@ -97,8 +102,12 @@ func (c *Client) call(ctx context.Context, body []byte, out any) error {
 		if !ok {
 			return err
 		}
-		if err := sleep(ctx, wait); err != nil {
+		// Waiting past the deadline would only bury err under a timeout.
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < wait {
 			return err
+		}
+		if serr := sleep(ctx, wait); serr != nil {
+			return errors.Join(err, serr)
 		}
 	}
 	return err
@@ -140,7 +149,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 
 func (c *Client) do(ctx context.Context, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.URL+"/v1/systemone", bytes.NewReader(body))
+		cmp.Or(c.URL, DefaultURL)+"/v1/systemone", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("typesafe: building request: %w", err)
 	}
@@ -202,5 +211,6 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	// Drop any rune split by the cut rather than emit invalid UTF-8.
+	return strings.ToValidUTF8(s[:n], "") + "…"
 }

@@ -75,3 +75,11 @@ func TestChoiceEmptyDescription(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRejectsTrailingJSON(t *testing.T) {
+	one := `{"questions": {"q": {"type": "noul", "instructions": "x"}}}`
+	_, err := Parse([]byte(one + "\n" + one))
+	if err == nil || !strings.Contains(err.Error(), "trailing data") {
+		t.Errorf("got %v", err)
+	}
+}

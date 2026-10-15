@@ -15,21 +15,27 @@ type checkCmd struct {
 func (c *checkCmd) run(ctx context.Context, stdin io.Reader) error {
 	var bad int
 	for _, path := range c.Files {
-		rf, err := loadRequest(path, stdin)
+		qf, err := loadQuestions(path, stdin)
 		if err != nil {
 			slog.ErrorContext(ctx, "invalid file", "error", err)
 			bad++
 			continue
 		}
-		problems := rf.Problems()
+		problems := qf.Problems()
 		for _, p := range problems {
-			slog.ErrorContext(ctx, "invalid question", "file", path, "problem", p)
+			slog.ErrorContext(ctx, "invalid question",
+				"file", path,
+				"problem", p,
+			)
 		}
 		if len(problems) > 0 {
 			bad++
 			continue
 		}
-		slog.DebugContext(ctx, "ok", "file", path, "questions", len(rf.Order))
+		slog.DebugContext(ctx, "ok",
+			"file", path,
+			"questions", len(qf.Order),
+		)
 	}
 	if bad > 0 {
 		return usagef("%d of %d files invalid", bad, len(c.Files))

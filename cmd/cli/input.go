@@ -23,15 +23,15 @@ func readInput(path string, stdin io.Reader) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// loadRequest parses a questions file in TOML or JSON.
-func loadRequest(path string, stdin io.Reader) (*questions.File, error) {
+// loadQuestions parses a questions file in TOML or JSON.
+func loadQuestions(path string, stdin io.Reader) (*questions.File, error) {
 	raw, err := readInput(path, stdin)
 	if err != nil {
-		return nil, fmt.Errorf("reading questions: %w", err)
+		return nil, usagef("reading questions: %w", err)
 	}
 	f, err := questions.Parse(raw)
 	if err != nil {
-		return nil, usagef("%s: %v", path, err)
+		return nil, usagef("%s: %w", path, err)
 	}
 	return f, nil
 }
@@ -114,16 +114,18 @@ func createOutput(path string, stdout io.Writer) (io.Writer, func(ok bool) error
 		return nil, nil, fmt.Errorf("creating output: %w", err)
 	}
 	commit := func(ok bool) error {
-		closeErr := f.Close()
-		if !ok || closeErr != nil {
-			_ = os.Remove(f.Name())
-			if closeErr != nil {
-				return fmt.Errorf("writing output: %w", closeErr)
-			}
-			return nil
+		// CreateTemp makes files 0600; give the output the usual mode.
+		err := f.Chmod(0o644)
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
 		}
-		if err := os.Rename(f.Name(), path); err != nil {
+		if ok && err == nil {
+			err = os.Rename(f.Name(), path)
+		}
+		if !ok || err != nil {
 			_ = os.Remove(f.Name())
+		}
+		if err != nil {
 			return fmt.Errorf("writing output: %w", err)
 		}
 		return nil

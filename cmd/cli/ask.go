@@ -48,14 +48,20 @@ func (a *askCmd) run(ctx context.Context, c *typesafe.Client, stdin io.Reader, s
 	if a.Questions == "-" && a.State == "-" {
 		return usagef("questions and state cannot both come from stdin")
 	}
+	if a.Timeout <= 0 {
+		return usagef("--timeout must be positive, got %s", a.Timeout)
+	}
 
-	rf, err := loadRequest(a.Questions, stdin)
+	qf, err := loadQuestions(a.Questions, stdin)
 	if err != nil {
 		return err
 	}
-	if problems := rf.Problems(); len(problems) > 0 {
+	if problems := qf.Problems(); len(problems) > 0 {
 		for _, p := range problems {
-			slog.ErrorContext(ctx, "invalid question", "file", a.Questions, "problem", p)
+			slog.ErrorContext(ctx, "invalid question",
+				"file", a.Questions,
+				"problem", p,
+			)
 		}
 		return usagef("%s: %d invalid question(s)", a.Questions, len(problems))
 	}
@@ -63,8 +69,8 @@ func (a *askCmd) run(ctx context.Context, c *typesafe.Client, stdin io.Reader, s
 	if c != nil {
 		c.LongContext = a.LongContext
 	}
-	model := cmp.Or(a.Model, rf.Model, typesafe.DefaultModel)
-	states, err := a.states(rf, stdin)
+	model := cmp.Or(a.Model, qf.Model, typesafe.DefaultModel)
+	states, err := a.states(qf, stdin)
 	if err != nil {
 		return err
 	}
@@ -84,24 +90,36 @@ func (a *askCmd) run(ctx context.Context, c *typesafe.Client, stdin io.Reader, s
 			return fmt.Errorf("interrupted after %d states: %w", total, ctx.Err())
 		}
 		total++
-		req := typesafe.Request{State: state, Model: model, Questions: rf.Questions}
+		req := typesafe.Request{State: state, Model: model, Questions: qf.Questions}
 		var resp *typesafe.Response
 		if err == nil {
 			resp, err = a.ask(ctx, c, req)
 		}
 		if err != nil {
 			failed++
-			slog.ErrorContext(ctx, "state failed", "state", total, "error", err)
+			slog.ErrorContext(ctx, "state failed",
+				"state", total,
+				"error", err,
+			)
 		}
-		if werr := a.write(w, rf.Order, req, resp, err); werr != nil {
+		if werr := a.write(w, qf.Order, req, resp, err); werr != nil {
 			_ = commit(false)
 			return fmt.Errorf("writing output: %w", werr)
 		}
 	}
+	// A Ctrl-C during the last state lands here rather than at the top
+	// of the loop; report it as an interrupt, not as failed states.
+	if ctx.Err() != nil {
+		_ = commit(false)
+		return fmt.Errorf("interrupted after %d states: %w", total, ctx.Err())
+	}
 	if err := commit(true); err != nil {
 		return err
 	}
-	slog.DebugContext(ctx, "done", "states", total, "failed", failed)
+	slog.DebugContext(ctx, "done",
+		"states", total,
+		"failed", failed,
+	)
 	if failed > 0 {
 		return fmt.Errorf("%d of %d states failed", failed, total)
 	}
@@ -110,13 +128,13 @@ func (a *askCmd) run(ctx context.Context, c *typesafe.Client, stdin io.Reader, s
 
 // states picks the state source: --text, then --state, then the
 // questions file's own state, then stdin.
-func (a *askCmd) states(rf *questions.File, stdin io.Reader) (iter.Seq2[any, error], error) {
+func (a *askCmd) states(qf *questions.File, stdin io.Reader) (iter.Seq2[any, error], error) {
 	if a.Text != "" {
 		return func(yield func(any, error) bool) { yield(a.Text, nil) }, nil
 	}
 	path := a.State
-	if path == "" && rf.State != nil {
-		return func(yield func(any, error) bool) { yield(rf.State, nil) }, nil
+	if path == "" && qf.State != nil {
+		return func(yield func(any, error) bool) { yield(qf.State, nil) }, nil
 	}
 	if path == "" {
 		path = "-"
@@ -130,7 +148,7 @@ func (a *askCmd) states(rf *questions.File, stdin io.Reader) (iter.Seq2[any, err
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("opening state: %w", err)
+		return nil, usagef("opening state: %w", err)
 	}
 	seq := readStates(f, format, a.Lines)
 	return func(yield func(any, error) bool) {

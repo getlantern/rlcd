@@ -6,17 +6,37 @@ _Reinforcement learning for calibrated decisions_ is a trained language model th
 
 ## Purpose
 
-Minimal wrapper for a RLCD HTTP API, with package and CLI entry points.
+Minimal wrapper for an RLCD HTTP API, with package and CLI entry points. RLCD should be used over chat-focused LLM when the only output desired is a confidence-ranked decision against preexisting criteria.
 
-## Agent Instuructions
+## Agent Instructions
 
 https://github.com/typesafe-ai/skills/blob/main/skills/typesafe-ai/SKILL.md
 
 ## Usage
 
+| variable | purpose |
+|---|---|
+| `TYPESAFE_API_KEY` | (required) authentication key, paired to service backing `TYPESAFE_BASE_URL` |
+| `TYPESAFE_BASE_URL` | Optional `https` API root. Use `https://openrouter.ai/api` for OpenRouter. |
+
+| command | action |
+|---|---|
+| `rlcd ask` | Evaluate state from `stdin` or _file_ against a questions file. |
+| `rlcd check FILE...` | Validate a questions file.  |
+| `rlcd example` | Print an example questions file covering every question type. |
+
+Stdin is read as one text state. Use `--lines` for one state per line, and `--state-format json` when stdin carries JSON or JSONL.
+
+| exit code | cause |
+|---|---|
+| `0` | Every state was answered. |
+| `1` | A state or the run failed; failed states still get an `{"error": ...}` line. |
+| `2` | Invalid flags, configuration, or questions. |
+| `130` | Interrupted. |
+
 ### CLI
 
-A single question from stdin:
+A single simple state from stdin:
 ```sh
 echo "Help! My payouts have been failing for 3 days." | rlcd ask --questions cmd/cli/example.toml | jq
 ```
