@@ -1,0 +1,61 @@
+# Example questions with all possible answer types.
+# Used as a test fixture, and output from the `example` subcommand.
+#
+# Run it:  echo "Help! My payouts have been failing for 3 days." \
+#            | rlcd ask -q example.toml -f table
+
+# Optional; --model overrides it.
+model = "jev-latest"
+
+# Noul: the probability that the answer is yes.
+[[questions]]
+id = "is_urgent"
+type = "noul"
+instructions = "Does this convey urgency?"
+
+# Noul with described outcomes.
+[[questions]]
+id = "is_spam"
+type = "noul"
+instructions = "Is this message spam?"
+criteria.true = "Unsolicited advertising or a scam"
+criteria.false = "A real customer writing about their account"
+
+# Choice: one option from a set. An empty description ("") means the
+# option is understood by its name alone; TOML has no null.
+[[questions]]
+id = "department"
+type = "choice"
+instructions = "Which team should handle this?"
+
+[questions.criteria]
+billing = "Payments, invoicing, refunds"
+technical = "Bugs, outages, integrations"
+sales = "Pricing, upgrades, new accounts"
+other = ""
+
+# Score: a probability-weighted position on ordered levels, from 0.
+# 2 to 10 levels.
+[[questions]]
+id = "frustration"
+type = "score"
+instructions = '''
+How frustrated is the customer, judged only from the
+tone of their message?
+'''
+criteria = [
+    "Calm",
+    "Mildly annoyed",
+    "Frustrated",
+    "Very angry",
+]
+
+# Structured instructions: put data in named fields and refer to them
+# in backticks.
+[[questions]]
+id = "is_vip_issue"
+type = "noul"
+
+[questions.instructions]
+question = "Is this about one of the `vip_topics`?"
+vip_topics = ["payouts", "account suspension", "data loss"]
