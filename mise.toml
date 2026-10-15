@@ -4,12 +4,12 @@ run = "go test -race ./..."
 
 [tasks.cli]
 description = "Run the CLI, passing through all arguments"
-run = "go build -o \"${TMPDIR:-/tmp}/rlcd\" ./cmd/cli && \"${TMPDIR:-/tmp}/rlcd\""
+run = "go build -o \"${TMPDIR:-/tmp}/rlcd\" ./cmd/rlcd && \"${TMPDIR:-/tmp}/rlcd\""
 raw = true
 
 [tasks.e2e]
 description = "Ask the real API the example questions (needs TYPESAFE_API_KEY)"
-run = "echo \"Help! My payouts have been failing for 3 days.\" | go run ./cmd/cli ask -q cmd/cli/example.toml"
+run = "echo \"Help! My payouts have been failing for 3 days.\" | go run ./cmd/rlcd ask -q cmd/rlcd/example.toml"
 
 [tasks.lint]
 description = "Run golangci-lint"

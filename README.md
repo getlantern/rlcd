@@ -38,7 +38,7 @@ Stdin is read as one text state. Use `--lines` for one state per line, and `--st
 
 A single simple state from stdin:
 ```sh
-echo "Help! My payouts have been failing for 3 days." | rlcd ask --questions cmd/cli/example.toml | jq
+echo "Help! My payouts have been failing for 3 days." | rlcd ask --questions cmd/rlcd/example.toml | jq
 ```
 
 Output
@@ -96,7 +96,7 @@ Output
 
 Process text against a Questions file, one state per line of `tickets.txt`:
 ```sh
-rlcd ask --questions cmd/cli/example.toml --state tickets.txt --lines --out results.jsonl
+rlcd ask --questions cmd/rlcd/example.toml --state tickets.txt --lines --out results.jsonl
 ```
 
 Output (`results.jsonl`, one line per line of `tickets.txt`, in the same order)
@@ -107,7 +107,7 @@ Output (`results.jsonl`, one line per line of `tickets.txt`, in the same order)
 Act on an answer:
 ```sh
 echo "Help! My payouts have been failing for 3 days." \
-  | rlcd ask --questions cmd/cli/example.toml \
+  | rlcd ask --questions cmd/rlcd/example.toml \
   | jq --exit-status '.answers.is_urgent.noul > 0.8' > /dev/null \
   && echo "page on-call" || echo "add to queue"
 ```
@@ -120,7 +120,7 @@ page on-call
 ### `pkg`
 
 ```go
-raw, err := os.ReadFile("cmd/cli/example.toml")
+raw, err := os.ReadFile("cmd/rlcd/example.toml")
 if err != nil {
 	slog.ErrorContext(ctx, "reading questions", "error", err)
 	os.Exit(1)
