@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Example response from https://docs.typesafe.ai/api, all three types.
@@ -135,27 +136,80 @@ func TestAskRetriesOverload(t *testing.T) {
 	}
 }
 
-func TestAskNoRetryOnServerError(t *testing.T) {
-	var calls atomic.Int32
-	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		w.Header().Set("x-typesafe-request-id", "req_1")
-		w.WriteHeader(http.StatusInternalServerError)
-		write(t, w, `{"error":"boom"}`)
-	})
-	_, err := c.Ask(context.Background(), Request{
-		State:     "x",
-		Questions: map[string]Question{"q": Noul("?")},
-	})
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("err = %v, want *APIError", err)
+func TestAskRetries(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fail       int // requests that fail before success
+		status     int // 0 drops the connection
+		retryAfter string
+		wantCalls  int32
+		wantStatus int // 0 means success
+	}{
+		"5xx then ok":          {fail: 1, status: 500, wantCalls: 2},
+		"network then ok":      {fail: 1, status: 0, wantCalls: 2},
+		"5xx gives up":         {fail: 9, status: 503, wantCalls: 3, wantStatus: 503},
+		"4xx not retried":      {fail: 9, status: 422, wantCalls: 1, wantStatus: 422},
+		"retry-after too long": {fail: 9, status: 429, retryAfter: "120", wantCalls: 1, wantStatus: 429},
+		"retry-after honored":  {fail: 1, status: 429, retryAfter: "0", wantCalls: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) > int32(tc.fail) {
+					write(t, w, docsResponse)
+					return
+				}
+				if tc.status == 0 {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = conn.Close()
+					return
+				}
+				w.Header().Set("Retry-After", tc.retryAfter)
+				w.Header().Set("x-typesafe-request-id", "req_1")
+				w.WriteHeader(tc.status)
+				write(t, w, `{"error":"boom"}`)
+			})
+			_, err := c.Ask(context.Background(), Request{
+				State:     "x",
+				Questions: map[string]Question{"q": Noul("?")},
+			})
+			if n := calls.Load(); n != tc.wantCalls {
+				t.Errorf("calls = %d, want %d", n, tc.wantCalls)
+			}
+			if tc.wantStatus == 0 {
+				if err != nil {
+					t.Errorf("err = %v", err)
+				}
+				return
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != tc.wantStatus ||
+				apiErr.RequestID != "req_1" {
+				t.Errorf("err = %v, want status %d", err, tc.wantStatus)
+			}
+		})
 	}
-	if apiErr.Status != 500 || apiErr.RequestID != "req_1" {
-		t.Errorf("apiErr = %+v", apiErr)
+}
+
+func TestRetryAfter(t *testing.T) {
+	future := time.Now().Add(10 * time.Second).UTC().Format(http.TimeFormat)
+	for in, want := range map[string]time.Duration{
+		"":                              0,
+		"5":                             5 * time.Second,
+		"-1":                            0,
+		"soon":                          0,
+		"Wed, 21 Oct 2015 07:28:00 GMT": 0, // past
+	} {
+		h := http.Header{"Retry-After": {in}}
+		if got := retryAfter(h); got != want {
+			t.Errorf("retryAfter(%q) = %v, want %v", in, got, want)
+		}
 	}
-	if n := calls.Load(); n != 1 {
-		t.Errorf("calls = %d, want 1", n)
+	got := retryAfter(http.Header{"Retry-After": {future}})
+	if got < 8*time.Second || got > 10*time.Second {
+		t.Errorf("retryAfter(date +10s) = %v", got)
 	}
 }
 
@@ -177,21 +231,23 @@ func write(t *testing.T, w io.Writer, s string) {
 	}
 }
 
-func TestModels(t *testing.T) {
-	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
-			t.Errorf("got %s %s", r.Method, r.URL.Path)
+func TestAskLongContextHeader(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		var got string
+		c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("TypeSafe-Danger-Zone-Long-Context")
+			write(t, w, docsResponse)
+		})
+		c.LongContext = on
+		if _, err := c.Ask(context.Background(), Request{
+			State:     "x",
+			Questions: map[string]Question{"q": Noul("?")},
+		}); err != nil {
+			t.Fatal(err)
 		}
-		if ct := r.Header.Get("Content-Type"); ct != "" {
-			t.Errorf("GET should not send Content-Type, got %q", ct)
+		want := map[bool]string{false: "", true: "true"}[on]
+		if got != want {
+			t.Errorf("LongContext=%v: header = %q, want %q", on, got, want)
 		}
-		write(t, w, `{"models":[{"name":"jev-latest","description":"Flagship","release_date":"2026-09-01"}]}`)
-	})
-	models, err := c.Models(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(models) != 1 || models[0].Name != "jev-latest" || models[0].ReleaseDate != "2026-09-01" {
-		t.Errorf("models = %+v", models)
 	}
 }

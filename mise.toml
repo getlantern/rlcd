@@ -10,3 +10,11 @@ raw = true
 [tasks.e2e]
 description = "Ask the real API the example questions (needs TYPESAFE_API_KEY)"
 run = "echo \"Help! My payouts have been failing for 3 days.\" | go run ./cmd/cli ask -q cmd/cli/example.toml"
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run ./..."
+
+[tools]
+go = "1.26"
+golangci-lint = "2.14"

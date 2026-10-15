@@ -15,6 +15,7 @@ import (
 
 	"github.com/pterm/pterm"
 
+	"github.com/getlantern/rlcd/pkg/questions"
 	"github.com/getlantern/rlcd/pkg/typesafe"
 )
 
@@ -29,6 +30,7 @@ type askCmd struct {
 	Format      string        `arg:"-f,--format" default:"json" help:"json or table"`
 	DryRun      bool          `arg:"--dry-run" help:"write request bodies instead of calling the API"`
 	Timeout     time.Duration `arg:"--timeout" default:"60s" help:"limit per state, including retries"`
+	LongContext bool          `arg:"--long-context" help:"raise context limits to 262k tokens; slower and less accurate"`
 }
 
 // run writes one result per state, in input order. A failed state
@@ -51,13 +53,16 @@ func (a *askCmd) run(ctx context.Context, c *typesafe.Client, stdin io.Reader, s
 	if err != nil {
 		return err
 	}
-	if problems := validate(rf); len(problems) > 0 {
+	if problems := rf.Problems(); len(problems) > 0 {
 		for _, p := range problems {
 			slog.ErrorContext(ctx, "invalid question", "file", a.Questions, "problem", p)
 		}
 		return usagef("%s: %d invalid question(s)", a.Questions, len(problems))
 	}
 
+	if c != nil {
+		c.LongContext = a.LongContext
+	}
 	model := cmp.Or(a.Model, rf.Model, typesafe.DefaultModel)
 	states, err := a.states(rf, stdin)
 	if err != nil {
@@ -105,7 +110,7 @@ func (a *askCmd) run(ctx context.Context, c *typesafe.Client, stdin io.Reader, s
 
 // states picks the state source: --text, then --state, then the
 // questions file's own state, then stdin.
-func (a *askCmd) states(rf *requestFile, stdin io.Reader) (iter.Seq2[any, error], error) {
+func (a *askCmd) states(rf *questions.File, stdin io.Reader) (iter.Seq2[any, error], error) {
 	if a.Text != "" {
 		return func(yield func(any, error) bool) { yield(a.Text, nil) }, nil
 	}

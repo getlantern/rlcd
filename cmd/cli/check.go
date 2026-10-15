@@ -21,7 +21,7 @@ func (c *checkCmd) run(ctx context.Context, stdin io.Reader) error {
 			bad++
 			continue
 		}
-		problems := validate(rf)
+		problems := rf.Problems()
 		for _, p := range problems {
 			slog.ErrorContext(ctx, "invalid question", "file", path, "problem", p)
 		}

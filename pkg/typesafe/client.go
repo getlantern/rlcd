@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -17,7 +19,8 @@ const (
 	DefaultModel = "jev-latest"
 
 	maxResponse = 8 << 20
-	// 429 and 529 only, per API docs, to avoid double billing for transport errors.
+	// Retries cover 429, 5xx, and network errors. Asking has no side
+	// effects, so a duplicate request can only cost tokens.
 	maxRetries    = 2
 	backoffBase   = 500 * time.Millisecond
 	maxRetryAfter = 30 * time.Second
@@ -29,6 +32,9 @@ type Client struct {
 	URL   string
 	Model string
 	HTTP  *http.Client
+	// LongContext raises the context limits to 262k tokens per request.
+	// It is slower and less accurate, so enable it only when needed.
+	LongContext bool
 }
 
 // NewClient returns a client with default URL, model, and a 30s timeout.
@@ -72,60 +78,53 @@ func (c *Client) Ask(ctx context.Context, req Request) (*Response, error) {
 	}
 
 	var out Response
-	if err := c.call(ctx, http.MethodPost, "/v1/systemone", body, &out); err != nil {
+	if err := c.call(ctx, body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// Model describes one model available to the account.
-type Model struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	ReleaseDate string `json:"release_date"`
-}
-
-// Models lists the model names the account can send in Request.Model.
-func (c *Client) Models(ctx context.Context) ([]Model, error) {
-	if c.Key == "" {
-		return nil, errors.New("typesafe: missing API key")
-	}
-	var out struct {
-		Models []Model `json:"models"`
-	}
-	if err := c.call(ctx, http.MethodGet, "/v1/models", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Models, nil
-}
-
-// call performs one API request, retrying 429 and 529,
-// and decodes a 2xx body into out.
-func (c *Client) call(ctx context.Context, method, path string, body []byte, out any) error {
+// call posts body, retrying transient failures,
+// and decodes a 2xx response into out.
+func (c *Client) call(ctx context.Context, body []byte, out any) error {
 	var err error
 	for attempt := range maxRetries + 1 {
-		err = c.do(ctx, method, path, body, out)
-		var apiErr *APIError
-		if !errors.As(err, &apiErr) || !retryable(apiErr.Status) {
+		err = c.do(ctx, body, out)
+		if err == nil || attempt == maxRetries || ctx.Err() != nil {
 			return err
 		}
-		if attempt == maxRetries {
-			break
+		wait, ok := retryDelay(err, attempt)
+		if !ok {
+			return err
 		}
-		if err := sleep(ctx, apiErr.delay(attempt)); err != nil {
+		if err := sleep(ctx, wait); err != nil {
 			return err
 		}
 	}
 	return err
 }
 
-// delay is how long to wait before retrying after the given attempt.
-// It honors Retry-After when within maxRetryAfter.
-func (e *APIError) delay(attempt int) time.Duration {
-	if e.retryAfter > 0 && e.retryAfter <= maxRetryAfter {
-		return e.retryAfter
+// retryDelay reports whether err is transient and how long to wait.
+// A Retry-After beyond maxRetryAfter is not worth waiting for, so the
+// error is returned instead.
+func retryDelay(err error, attempt int) (time.Duration, bool) {
+	var apiErr *APIError
+	var netErr *url.Error
+	switch {
+	case errors.As(err, &apiErr):
+		if apiErr.Status != http.StatusTooManyRequests && apiErr.Status < 500 {
+			return 0, false
+		}
+		if d := apiErr.retryAfter; d > 0 {
+			return d, d <= maxRetryAfter
+		}
+	case errors.As(err, &netErr):
+	default:
+		return 0, false
 	}
-	return backoffBase << attempt
+	// Jitter to 50-100% of the backoff so parallel callers spread out.
+	d := backoffBase << attempt
+	return d/2 + rand.N(d/2+1), true
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -139,20 +138,17 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
-	url := c.URL + path
-	var rd io.Reader
-	if body != nil {
-		rd = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, url, rd)
+func (c *Client) do(ctx context.Context, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.URL+"/v1/systemone", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("typesafe: building request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Key)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if c.LongContext {
+		req.Header.Set("TypeSafe-Danger-Zone-Long-Context", "true")
 	}
 
 	hc := c.HTTP
@@ -161,7 +157,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("typesafe: %s %s: %w", method, url, err)
+		return fmt.Errorf("typesafe: %w", err)
 	}
 	// The body is fully read below, so a close error carries no information.
 	defer func() { _ = resp.Body.Close() }()
@@ -189,17 +185,17 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 	return nil
 }
 
-func retryable(status int) bool {
-	return status == http.StatusTooManyRequests || status == 529
-}
-
-// retryAfter parses a Retry-After header given in seconds.
+// retryAfter parses a Retry-After header in seconds or as an HTTP date.
+// It returns 0 when absent, invalid, or already past.
 func retryAfter(h http.Header) time.Duration {
-	secs, err := strconv.Atoi(h.Get("Retry-After"))
-	if err != nil || secs < 0 {
-		return 0
+	v := h.Get("Retry-After")
+	if secs, err := strconv.Atoi(v); err == nil {
+		return max(time.Duration(secs)*time.Second, 0)
 	}
-	return time.Duration(secs) * time.Second
+	if t, err := http.ParseTime(v); err == nil {
+		return max(time.Until(t), 0)
+	}
+	return 0
 }
 
 func truncate(s string, n int) string {

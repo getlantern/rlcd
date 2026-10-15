@@ -26,7 +26,7 @@ func TestExampleIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := validate(rf); len(p) > 0 {
+	if p := rf.Problems(); len(p) > 0 {
 		t.Fatalf("example.toml invalid: %v", p)
 	}
 	if !slices.Equal(rf.Order, exampleIDs) {
@@ -51,40 +51,11 @@ func TestDryRunRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := validate(rf); len(p) > 0 {
+	if p := rf.Problems(); len(p) > 0 {
 		t.Fatal(p)
 	}
 	if rf.State != "hi" || len(rf.Questions) != len(exampleIDs) {
 		t.Errorf("round trip = state %v, %d questions", rf.State, len(rf.Questions))
-	}
-}
-
-func TestValidate(t *testing.T) {
-	for name, tc := range map[string]struct {
-		toml string
-		want string
-	}{
-		"typo key":     {`instrutions = "x"`, `unknown key "instrutions"`},
-		"one level":    {"type='score'\ninstructions='x'\ncriteria=['a']", "2 to 10 levels"},
-		"bad type":     {"type='bool'\ninstructions='x'", `unknown type "bool"`},
-		"no criteria":  {"type='choice'\ninstructions='x'", "choice criteria"},
-		"no instr":     {"type='noul'", "missing instructions"},
-		"noul bad key": {"type='noul'\ninstructions='x'\ncriteria.yes='y'", `unknown key "yes"`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			doc := "[[questions]]\nid = 'q'\n" + tc.toml + "\n"
-			rf, err := loadRequest("-", strings.NewReader(doc))
-			var got string
-			switch {
-			case err != nil:
-				got = err.Error()
-			default:
-				got = strings.Join(validate(rf), "; ")
-			}
-			if !strings.Contains(got, tc.want) {
-				t.Errorf("got %q, want it to contain %q", got, tc.want)
-			}
-		})
 	}
 }
 
@@ -225,5 +196,54 @@ func TestAskUsageErrors(t *testing.T) {
 				t.Errorf("err = %v, want usageError", err)
 			}
 		})
+	}
+}
+
+func TestNewClientEnv(t *testing.T) {
+	t.Setenv("TYPESAFE_API_KEY", "k")
+
+	t.Setenv("TYPESAFE_BASE_URL", "")
+	c, err := newClient()
+	if err != nil || c.URL != typesafe.DefaultURL {
+		t.Errorf("default: url %q, err %v", c.URL, err)
+	}
+
+	t.Setenv("TYPESAFE_BASE_URL", "https://openrouter.ai/api/")
+	c, err = newClient()
+	if err != nil || c.URL != "https://openrouter.ai/api" {
+		t.Errorf("override: url %q, err %v", c.URL, err)
+	}
+
+	for _, bad := range []string{"http://openrouter.ai/api", "openrouter.ai/api", "https://"} {
+		t.Setenv("TYPESAFE_BASE_URL", bad)
+		var usage *usageError
+		if _, err := newClient(); !errors.As(err, &usage) {
+			t.Errorf("%q: err = %v, want usageError", bad, err)
+		}
+	}
+
+	t.Setenv("TYPESAFE_API_KEY", "")
+	if _, err := newClient(); err == nil {
+		t.Error("want error for missing key")
+	}
+}
+
+func TestAskLongContextFlag(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("TypeSafe-Danger-Zone-Long-Context")
+		_, _ = io.WriteString(w, `{"model":"m","answers":{}}`)
+	}))
+	t.Cleanup(srv.Close)
+	c := typesafe.NewClient("k")
+	c.URL = srv.URL
+
+	a := askCmd{Questions: "example.toml", Text: "hi", StateFormat: "auto",
+		Out: "-", Format: "json", Timeout: 5 * time.Second, LongContext: true}
+	if err := a.run(context.Background(), c, nil, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got != "true" {
+		t.Errorf("long-context header = %q, want true", got)
 	}
 }

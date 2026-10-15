@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -27,7 +28,6 @@ var exampleTOML []byte
 type cli struct {
 	Ask     *askCmd     `arg:"subcommand:ask" help:"evaluate states against questions"`
 	Check   *checkCmd   `arg:"subcommand:check" help:"validate questions files offline"`
-	Models  *modelsCmd  `arg:"subcommand:models" help:"list models available to the account"`
 	Example *exampleCmd `arg:"subcommand:example" help:"print an example questions file"`
 
 	Verbose bool `arg:"-v,--verbose" help:"debug logging to stderr"`
@@ -86,21 +86,14 @@ func run(ctx context.Context, args *cli, stdin io.Reader, stdout io.Writer) erro
 	case args.Ask != nil:
 		var c *typesafe.Client
 		if !args.Ask.DryRun {
-			key, err := apiKey()
-			if err != nil {
+			var err error
+			if c, err = newClient(); err != nil {
 				return err
 			}
-			c = typesafe.NewClient(key)
 		}
 		return args.Ask.run(ctx, c, stdin, stdout)
 	case args.Check != nil:
 		return args.Check.run(ctx, stdin)
-	case args.Models != nil:
-		key, err := apiKey()
-		if err != nil {
-			return err
-		}
-		return args.Models.run(ctx, typesafe.NewClient(key), stdout)
 	case args.Example != nil:
 		_, err := stdout.Write(exampleTOML)
 		return err
@@ -108,11 +101,25 @@ func run(ctx context.Context, args *cli, stdin io.Reader, stdout io.Writer) erro
 	return usagef("a subcommand is required")
 }
 
-// apiKey reads TYPESAFE_API_KEY. There is deliberately no flag for it,
-// so the key never lands in shell history or ps output.
-func apiKey() (string, error) {
-	if key := strings.TrimSpace(os.Getenv("TYPESAFE_API_KEY")); key != "" {
-		return key, nil
+// newClient configures a client from the environment only. There are
+// deliberately no flags, so the key never lands in shell history or ps.
+//
+//   - TYPESAFE_API_KEY: required.
+//   - TYPESAFE_BASE_URL: optional API root, e.g. https://openrouter.ai/api
+//     to use an OpenRouter key. Must be https so the key is never sent
+//     in the clear.
+func newClient() (*typesafe.Client, error) {
+	key := strings.TrimSpace(os.Getenv("TYPESAFE_API_KEY"))
+	if key == "" {
+		return nil, usagef("set TYPESAFE_API_KEY")
 	}
-	return "", usagef("set TYPESAFE_API_KEY")
+	c := typesafe.NewClient(key)
+	if raw := strings.TrimSpace(os.Getenv("TYPESAFE_BASE_URL")); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return nil, usagef("TYPESAFE_BASE_URL must be an https URL, got %q", raw)
+		}
+		c.URL = strings.TrimRight(raw, "/")
+	}
+	return c, nil
 }
