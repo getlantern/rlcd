@@ -1,0 +1,23 @@
+{
+  "state": {
+    "camera": "e48a6f30-cam"
+  },
+  "questions": {
+    "gesture": {
+      "type": "choice",
+      "instructions": "Which gesture is the hand in `camera` making?",
+      "criteria": {
+        "thumbs_up": "0b6c51aa-thumb",
+        "open_palm": {
+          "description": "A hand held up with the palm facing the camera.",
+          "examples": [
+            "4fd2e7b9-palm1",
+            "c83a0e15-palm2"
+          ]
+        },
+        "fist": "a7e94d02-fist",
+        "none": "No hand, or a hand that matches none of the examples."
+      }
+    }
+  }
+}
